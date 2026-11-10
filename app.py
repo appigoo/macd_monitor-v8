@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         MACD 瀑布動能傳導系統  v2.0                          ║
+║         MACD 瀑布動能傳導系統  v3.0                          ║
 ║                                                              ║
 ║  設計原理：                                                   ║
 ║  1. 時框瀑布傳導：1m→5m→15m→30m→1h→1d→1w                   ║
@@ -41,6 +41,17 @@
 ║  13. 訊號判定一律用「已收盤」bar，杜絕未收盤 bar 重繪誤報    ║
 ║  14. 時間戳修正為真正的美東時間；休市/非交易時段標註         ║
 ╚══════════════════════════════════════════════════════════════╝
+
+v3.0 改進摘要（回測可信度 + 效能 + 穩定性）
+ 15. 回測前視偏誤修正：高時框(5m/15m/1h/1d)只採用「已收盤」的 bar，
+     1d 只用前一交易日；舊版會偷看當天收盤的 1d/1h Histogram，勝率虛高
+ 16. 回測成交更貼近現實：止損/止盈改用 bar 的 High/Low 判定，
+     跳空用開盤價成交，同根觸及雙邊時保守視為先止損；ATR 用「入場當下」值
+ 17. 回測新增單邊成本（含滑價）、最大回撤；出場原因統計不再漏掉動態出場
+ 18. 數據層：全 session 共享快取 + 依時框分級 TTL + 並行預載；
+     抓取失敗時保留上次好數據，不再被空表覆蓋；自動刷新不再每次清空全部快取
+ 19. Telegram：Markdown 解析失敗自動退回純文字；去重跨分頁/重新整理共享
+ 20. 清理：重複 footer、裸 except、無用 f-string、classify_status 提速
 """
 
 import streamlit as st
@@ -53,6 +64,8 @@ from datetime import datetime, time as dtime
 import requests
 import time
 import hashlib
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from zoneinfo import ZoneInfo
 
 # ══════════════════════════════════════════════════════════════
@@ -1123,21 +1136,20 @@ def classify_status(hist, macd, signal):
     out = []
     # 反轉閾值用 Histogram 滾動標準差歸一化（取代固定 0.005，
     # 否則 TSLA 5m 級別的 Hist 永遠不會命中「接近反轉」）
-    sig_roll = hist.rolling(40, min_periods=5).std()
-    for i in range(len(hist)):
-        h  = hist.iloc[i]
-        hp = hist.iloc[i-1]  if i>0 else h
-        m  = macd.iloc[i]
-        s  = signal.iloc[i]
-        mp = macd.iloc[i-1]  if i>0 else m
-        sp = signal.iloc[i-1] if i>0 else s
-        sg = sig_roll.iloc[i]
-        thr = max(0.005, 0.15 * sg) if pd.notna(sg) else 0.005
-        # v2.17：已發生的交叉（金叉＝Hist 由負轉正，死叉＝由正轉負）優先判定，
-        # 不可被「數值很小」吞掉；「接近交叉」必須看 Hist 的走向：
-        #   Hist<0 且向上收斂 → 接近金叉；Hist>0 且向下收斂 → 接近死叉。
-        # 舊版 abs(h)<thr 一律標「接近反轉」並對應「金叉概率提升」，
-        # 剛剛死叉、Hist 還在往下掉時也會被標成金叉概率提升。
+    h_a = hist.to_numpy(dtype=float)
+    m_a = macd.to_numpy(dtype=float)
+    s_a = signal.to_numpy(dtype=float)
+    sig_roll = hist.rolling(40, min_periods=5).std().to_numpy(dtype=float)
+    for i in range(len(h_a)):
+        h  = h_a[i]
+        hp = h_a[i-1] if i > 0 else h
+        m  = m_a[i]
+        s  = s_a[i]
+        mp = m_a[i-1] if i > 0 else m
+        sp = s_a[i-1] if i > 0 else s
+        sg = sig_roll[i]
+        thr = max(0.005, 0.15 * sg) if not np.isnan(sg) else 0.005
+        # v2.17：已發生的交叉優先判定；「接近交叉」必須看 Hist 的走向
         if   i>0 and hp<0 and h>=0:               st = "Histogram翻正"          # 金叉已成
         elif i>0 and hp>=0 and h<0:               st = "Histogram翻負"          # 死叉已成
         elif i>0 and abs(h) < thr and h<0 and h>hp:  st = "接近金叉"
@@ -1194,37 +1206,79 @@ def pc(v):
 # ══════════════════════════════════════════════════════════════
 # 資料獲取
 # ══════════════════════════════════════════════════════════════
+# 各時框的最短重抓間隔（秒）。大時框一分鐘內不會變，沒必要每次刷新都重抓
+_FETCH_TTL = {"1m": 60, "2m": 60, "5m": 60, "15m": 120, "30m": 180,
+              "60m": 300, "1h": 300, "90m": 300,
+              "1d": 600, "1wk": 1800, "1mo": 3600}
+
+
+@st.cache_resource
+def _data_store():
+    """跨 session 共享的數據倉庫（同一個 Streamlit 進程內所有分頁共用）。"""
+    return {"lock": threading.Lock(), "data": {}, "errors": {}, "last_fetch": 0.0}
+
+
+def _ttl_for(interval):
+    base = st.session_state.get("refresh_interval", 60)
+    # 減 5 秒：避免「剛好差零點幾秒沒過期」導致多等一整輪
+    return max(5, max(base, _FETCH_TTL.get(interval, 60)) - 5)
+
+
+def _download(symbol, period, interval):
+    df = yf.Ticker(symbol).history(period=period, interval=interval)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+
+
+def _fetch_one(store, symbol, period, interval, ttl):
+    """執行緒安全：不碰 st.session_state，可放進 ThreadPoolExecutor。"""
+    key = (symbol, period, interval)
+    now = time.time()
+    with store["lock"]:
+        ent = store["data"].get(key)
+    if ent is not None and now - ent["ts"] < ttl:
+        return ent["df"]
+    err = None
+    try:
+        df = _download(symbol, period, interval)
+        if df.empty:
+            err = "Yahoo 回傳空數據"
+    except Exception as e:
+        df, err = pd.DataFrame(), f"{type(e).__name__}: {str(e)[:80]}"
+    with store["lock"]:
+        if df.empty:
+            store["errors"][key] = err
+            if ent is not None and not ent["df"].empty:
+                # 失敗：保留上次好數據，15 秒後再試（不要用空表覆蓋）
+                ent["ts"] = now - ttl + 15
+                return ent["df"]
+            store["data"][key] = {"df": df, "ts": now - ttl + 15}
+            return df
+        store["errors"].pop(key, None)
+        store["data"][key] = {"df": df, "ts": now}
+        store["last_fetch"] = now
+    return df
+
+
 def fetch_data(symbol, period, interval):
-    """
-    Session-state 快取版本：
-    - 每次頁面載入檢查快取是否過期
-    - 過期（超過 refresh_interval 秒）→ 清除快取，重新拉取
-    - 未過期 → 直接返回 session_state 中的 DataFrame
-    - 完全不依賴 st.cache_data，確保自動刷新時數據一定更新
-    """
-    import time as _t
-    ttl      = st.session_state.get("refresh_interval", 60)
-    cache_key = f"df_{symbol}_{period}_{interval}"
-    ts_key    = f"ts_{symbol}_{period}_{interval}"
-    now       = _t.time()
+    """共享快取 + 分級 TTL；失敗時保留上次成功的數據。"""
+    store = _data_store()
+    df = _fetch_one(store, symbol, period, interval, _ttl_for(interval))
+    st.session_state["_last_any_fetch_ts"] = store["last_fetch"] or time.time()
+    return df
 
-    # 檢查是否需要更新
-    last_fetch = st.session_state.get(ts_key, 0)
-    if now - last_fetch >= ttl or cache_key not in st.session_state:
-        # 過期或從未拉取 → 重新取數據
-        try:
-            df = yf.Ticker(symbol).history(period=period, interval=interval)
-            if df.empty:
-                df = pd.DataFrame()
-            else:
-                df = df[["Open","High","Low","Close","Volume"]].dropna()
-        except:
-            df = pd.DataFrame()
-        st.session_state[cache_key] = df
-        st.session_state[ts_key]    = now
-        st.session_state["_last_any_fetch_ts"] = now
 
-    return st.session_state[cache_key]
+def prefetch_all(specs, max_workers=6):
+    """並行預載 [(symbol, period, interval), ...]；之後的 fetch_data 直接命中快取。"""
+    store = _data_store()
+    ttl = {iv: _ttl_for(iv) for _, _, iv in specs}
+    jobs = sorted(specs)
+    if not jobs:
+        return
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        list(ex.map(lambda j: _fetch_one(store, j[0], j[1], j[2], ttl[j[2]]), jobs))
+    st.session_state["_last_any_fetch_ts"] = store["last_fetch"] or time.time()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -2221,14 +2275,14 @@ def build_trade_plan(direction, level, pts, trig, style):
                     f"  止損      {px + 1.0*a:.2f}（+1.0×ATR 觸發時框）",
                     f"  目標1     {px - 1.5*a:.2f}（-1.5×ATR，到手止損移保本）",
                     f"  目標2     {px - 3.0*a:.2f}（-3.0×ATR，追蹤出場）",
-                    f"  倉位      首倉全額；評分 ≥7 可於反抽 VWAP 加倉一次",
-                    f"  持多倉    立即減半；跌破 VWAP 全部離場",
+                    "  倉位      首倉全額；評分 ≥7 可於反抽 VWAP 加倉一次",
+                    "  持多倉    立即減半；跌破 VWAP 全部離場",
                 ]
             else:
                 L += [
                     f"  試探空單  ≤1/3 倉位 @ {px:.2f}",
                     f"  止損      {px + 0.75*a:.2f}（+0.75×ATR 收緊）",
-                    f"  升級      評分升至 ≥5 補至全倉；退回 <3 分立即平倉",
+                    "  升級      評分升至 ≥5 補至全倉；退回 <3 分立即平倉",
                 ]
         else:  # bull
             if level == "red":
@@ -2237,27 +2291,27 @@ def build_trade_plan(direction, level, pts, trig, style):
                     f"  止損      {px - 1.0*a:.2f}（-1.0×ATR 觸發時框）",
                     f"  目標1     {px + 1.5*a:.2f}（+1.5×ATR，到手止損移保本）",
                     f"  目標2     {px + 3.0*a:.2f}（+3.0×ATR，追蹤出場）",
-                    f"  倉位      首倉全額；評分 ≥7 可於回踩 VWAP 加倉一次",
-                    f"  持空倉    立即減半；站回 VWAP 全部回補",
+                    "  倉位      首倉全額；評分 ≥7 可於回踩 VWAP 加倉一次",
+                    "  持空倉    立即減半；站回 VWAP 全部回補",
                 ]
             else:
                 L += [
                     f"  試探多單  ≤1/3 倉位 @ {px:.2f}",
                     f"  止損      {px - 0.75*a:.2f}（-0.75×ATR 收緊）",
-                    f"  升級      評分升至 ≥5 補至全倉；退回 <3 分立即平倉",
+                    "  升級      評分升至 ≥5 補至全倉；退回 <3 分立即平倉",
                 ]
     else:  # 穩健
         if level == "red":
             if direction == "bear":
                 L += [
-                    f"  空單進場  下一根 K 線收盤確認後 @ 市價",
+                    "  空單進場  下一根 K 線收盤確認後 @ 市價",
                     f"  止損      {px + 1.5*a:.2f}（+1.5×ATR 觸發時框）",
                     f"  目標      {px - 2.0*a:.2f} / {px - 3.5*a:.2f}",
                     f"  持多倉    減倉並收緊止損至 {px + 1.0*a:.2f}",
                 ]
             else:
                 L += [
-                    f"  多單進場  下一根 K 線收盤確認後 @ 市價",
+                    "  多單進場  下一根 K 線收盤確認後 @ 市價",
                     f"  止損      {px - 1.5*a:.2f}（-1.5×ATR 觸發時框）",
                     f"  目標      {px + 2.0*a:.2f} / {px + 3.5*a:.2f}",
                 ]
@@ -2415,16 +2469,23 @@ def build_tg_msg(symbol, cascade, resonance, confirm_tfs, trigger_tf, close_pric
     return "\n".join(lines)
 
 def send_telegram(token, chat_id, text):
+    """Markdown 解析失敗（訊息含 _ * 等字元）時自動退回純文字；截斷到 4096 上限。"""
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    text = text[:4000]
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id":chat_id,"text":text,"parse_mode":"Markdown"},
-            timeout=10,
-        )
-        return r.status_code==200, r.text
+        r = requests.post(url, json={"chat_id": chat_id, "text": text,
+                                     "parse_mode": "Markdown"}, timeout=10)
+        if r.status_code == 400 and "parse" in r.text.lower():
+            r = requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=10)
+        return r.status_code == 200, r.text
     except Exception as e:
         return False, str(e)
 
+
+@st.cache_resource
+def _tg_sent_store():
+    """跨分頁/重新整理共享的已推送記錄 {hash: timestamp}。"""
+    return {}
 
 
 # ══════════════════════════════════════════════════════════════
@@ -2450,8 +2511,7 @@ BACKTEST_PERIODS = {
 }
 
 # 回測固定用 60 天日內數據
-BT_INTRADAY_CONFIGS = {
-    "1m":  {"period": "7d",  "interval": "1m"},
+BT_INTRADAY_CONFIGS = {   # v3.0：1m 回測從未使用，移除（省一次請求、少一個失敗點）
     "5m":  {"period": "60d", "interval": "5m"},
     "15m": {"period": "60d", "interval": "15m"},
     "30m": {"period": "60d", "interval": "30m"},
@@ -2475,31 +2535,38 @@ def fetch_bt_tf(symbol: str, period: str, interval: str) -> pd.DataFrame:
                 df = df[["Open","High","Low","Close","Volume"]].dropna()
                 if df.index.tz is not None:
                     df.index = df.index.tz_convert("America/New_York").tz_localize(None)
-        except:
+        except Exception:
             df = pd.DataFrame()
         st.session_state[cache_key] = df
-        st.session_state[ts_key]    = now
+        # 失敗/空數據只快取 30 秒，不要卡 5 分鐘
+        st.session_state[ts_key]    = now if not df.empty else now - 270
     return st.session_state[cache_key]
 
 
-def get_d1_series(df: pd.DataFrame) -> pd.Series:
+def get_d1_series(df: pd.DataFrame):
     """
-    為 df 每一根 K 線計算當時的 D+1 預測值。
-    使用 rolling 方式，每個時間點只用歷史數據（無未來偷看）。
+    每根 K 線「收盤當下」的 D+1 預測（與 predict_next3 同一公式，向量化）。
+    只用截至該根為止的歷史數據 → 無未來偷看。回傳 (d1, hist)。
     """
     _, _, hist = calc_macd(df["Close"])
-    d1_vals = pd.Series(index=df.index, dtype=float)
-    for i in range(3, len(hist)):
-        v     = hist.iloc[i-2:i+1].values          # 最近3根
-        slope = (v[-1] - v[0]) / 2
-        d1_vals.iloc[i] = v[-1] + slope
-    return d1_vals, hist
+    d1 = hist + (hist - hist.shift(2)) / 2
+    d1.iloc[:3] = np.nan                      # 與舊版一致：前 3 根不產生預測
+    return d1, hist
 
 
-def _latest_before(series: pd.Series, t) -> float:
-    """取時間點 t 之前（含）最新的有效值，用於跨時框對齊"""
-    sub = series[series.index <= t].dropna()
-    return float(sub.iloc[-1]) if len(sub) > 0 else np.nan
+def _ns(x) -> pd.DatetimeIndex:
+    return pd.DatetimeIndex(x).astype("datetime64[ns]")
+
+
+def _bar_close_time(df: pd.DataFrame, minutes: int) -> pd.DatetimeIndex:
+    """
+    K 棒「收盤時間」= 開盤時間（yfinance index）+ 週期，且不超過當日 16:00
+    （美股最後一根 1h 棒 15:30 開、只有 30 分鐘）。
+    """
+    idx   = pd.DatetimeIndex(df.index)
+    close = idx + pd.Timedelta(minutes=minutes)
+    cap   = idx.normalize() + pd.Timedelta(hours=16)
+    return pd.DatetimeIndex(np.minimum(close.values, cap.values))
 
 
 def align_to_30m(df_30m: pd.DataFrame,
@@ -2508,84 +2575,65 @@ def align_to_30m(df_30m: pd.DataFrame,
                  df_1h:  pd.DataFrame,
                  df_1d:  pd.DataFrame) -> pd.DataFrame:
     """
-    以 30m K 線為基準時間軸，對齊各時框最新狀態。
-    每根 30m K 線結束時，查詢當時各時框的最新值（無未來偷看）。
+    以 30m K 線「收盤時間」為決策時點，對齊各時框「截至當時已收盤」的最新值。
+
+    v3.0 修正（舊版前視偏誤）：
+      舊版用 K 棒「開盤時間 <= 30m 開盤時間」取值，會拿到仍在形成中的 1h bar，
+      以及「當天」尚未收盤的 1d bar（含當天收盤價）→ 回測等於偷看未來。
+      現在：5m/15m/1h 只取收盤時間 <= 決策時點的 bar；1d 只取「前一交易日」及更早。
     """
-    # 計算各時框的 D+1 預測序列 和 Histogram 序列
-    # get_d1_series 回傳 (d1_series, hist_series)
-    d1_5m,  hist_5m  = get_d1_series(df_5m)
-    d1_15m, hist_15m = get_d1_series(df_15m)
-    d1_30m, hist_30m = get_d1_series(df_30m)
-    d1_1h,  hist_1h  = get_d1_series(df_1h)
-    # 1d 只需要 Histogram（不需要 D+1 預測），calc_macd 回傳3個值
-    _, _, hist_1d = calc_macd(df_1d["Close"])
+    d1_30, h_30 = get_d1_series(df_30m)
+    base = pd.DataFrame({
+        "T":     _ns(_bar_close_time(df_30m, 30)),
+        "time":  _ns(df_30m.index),
+        "open":  df_30m["Open"].values,
+        "high":  df_30m["High"].values,
+        "low":   df_30m["Low"].values,
+        "close": df_30m["Close"].values,
+        "atr":   atr_series(df_30m).values,       # 逐根 ATR（舊版用最後一根 ATR = 前視）
+        "h30":   h_30.values,
+        "d1_30": d1_30.values,
+    })
 
-    rows = []
-    for i in range(10, len(df_30m)):
-        t30 = df_30m.index[i]   # 當前 30m K 線結束時間
+    for d, mins, hn, dn in [(df_5m, 5, "h5", "d1_5"),
+                            (df_15m, 15, "h15", "d1_15"),
+                            (df_1h, 60, "h1h", "d1_1h")]:
+        d1_, h_ = get_d1_series(d)
+        right = pd.DataFrame({"avail": _ns(_bar_close_time(d, mins)),
+                              hn: h_.values, dn: d1_.values}).sort_values("avail")
+        base = pd.merge_asof(base, right, left_on="T", right_on="avail",
+                             direction="backward").drop(columns="avail")
 
-        # 30m 本身（直接用 index，不需要 latest_before）
-        h30   = float(hist_30m.iloc[i])
-        d1_30 = float(d1_30m.iloc[i]) if not pd.isna(d1_30m.iloc[i]) else np.nan
+    # 1d：當天的日線要收盤後才算數 → 最早從「隔天 00:00」起可用
+    _, _, h_1d = calc_macd(df_1d["Close"])
+    right = pd.DataFrame({
+        "avail": _ns(pd.DatetimeIndex(df_1d.index).normalize() + pd.Timedelta(days=1)),
+        "h1d":   h_1d.values,
+    }).sort_values("avail")
+    base = pd.merge_asof(base, right, left_on="T", right_on="avail",
+                         direction="backward").drop(columns="avail")
 
-        # 5m / 15m / 1h：t30 之前最新值
-        h5    = _latest_before(hist_5m,  t30)
-        d5    = _latest_before(d1_5m,    t30)
-        h15   = _latest_before(hist_15m, t30)
-        d15   = _latest_before(d1_15m,   t30)
-        h1h   = _latest_before(hist_1h,  t30)
-        d1h   = _latest_before(d1_1h,    t30)
-
-        # 1d：取 t30 日期當天或之前最新日線
-        t30_date = pd.Timestamp(t30).date()
-        sub_1d   = hist_1d[pd.to_datetime(hist_1d.index).date <= t30_date]
-        h1d      = float(sub_1d.iloc[-1]) if len(sub_1d) > 0 else np.nan
-
-        rows.append({
-            "time":  t30,
-            "close": df_30m["Close"].iloc[i],
-            # 30m
-            "h30":   h30,
-            "d1_30": d1_30,
-            # 5m
-            "h5":    h5,
-            "d1_5":  d5,
-            # 15m
-            "h15":   h15,
-            "d1_15": d15,
-            # 1h 確認
-            "h1h":   h1h,
-            "d1_1h": d1h,
-            # 1d 確認
-            "h1d":   h1d,
-        })
-
-    return pd.DataFrame(rows).set_index("time")
+    base = base.drop(columns="T").set_index("time").iloc[10:]
+    base.index.name = "time"
+    return base
 
 
 def run_cascade_backtest(symbol: str, atr_sl: float = 1.5,
                           atr_tp: float = 3.0, hold_bars: int = 6,
-                          exit_mode: str = "固定根數") -> dict:
+                          exit_mode: str = "固定根數",
+                          cost_pct: float = 0.05) -> dict:
     """
     三步瀑布傳導回測（最近 60 天 30m K 線）
 
-    正確的三步時序邏輯：
-    ┌─ 每根 K 線持續檢查 ──────────────────────────────────┐
-    │ Step 1  h1d > 0 AND h1h > 0   → 大方向多頭確認      │
-    │ Step 2  預警根：h30 < 0                              │
-    │         AND d1_5>0, d1_15>0, d1_30>0               │
-    │         （傳導鏈 D+1 全部預測翻正，但30m尚未翻）     │
-    │ Step 3  入場根（預警根的下一根）：                   │
-    │         h30_prev < 0 AND h30_now >= 0               │
-    │         （30m 實際翻正 → 當根收盤入場）              │
-    └──────────────────────────────────────────────────────┘
-    出場模式（exit_mode）：
-      "固定根數"    → 持倉 hold_bars 根 30m K 線後平倉
-      "30m轉負"     → 30m Histogram 再次轉負時出場
-      "1d/1h轉負"   → 1d 或 1h Histogram 轉負時出場（跟隨大趨勢）
-    所有模式均疊加 ATR 止損 / ATR 止盈保護
+    Step 1  h1d > 0 AND h1h > 0                    → 大方向多頭確認（皆為已收盤數據）
+    Step 2  預警根：h30 < 0 且 d1_5/d1_15/d1_30 > 0 → 傳導鏈預測翻正、30m 尚未翻
+    Step 3  入場根：h30_prev < 0 且 h30_now >= 0     → 當根收盤入場
+
+    出場：ATR 止損/止盈（用 bar 的 High/Low 判定；跳空以開盤價成交；
+          同一根同時觸及雙邊時保守視為先止損）＋ 三種模式之一
+      固定根數 / 30m轉負 / 1d/1h轉負
+    cost_pct：單邊成本（%，含滑價與手續費），每筆來回扣 2×cost_pct
     """
-    # ── 載入所有時框 ─────────────────────────────────────
     dfs = {}
     for tf, cfg in BT_INTRADAY_CONFIGS.items():
         df = fetch_bt_tf(symbol, cfg["period"], cfg["interval"])
@@ -2593,172 +2641,146 @@ def run_cascade_backtest(symbol: str, atr_sl: float = 1.5,
             return {"error": f"{tf} 數據載入失敗"}
         dfs[tf] = df
 
-    # ── 時框對齊 ─────────────────────────────────────────
     try:
-        aligned = align_to_30m(
-            dfs["30m"], dfs["5m"], dfs["15m"], dfs["1h"], dfs["1d"]
-        )
+        aligned = align_to_30m(dfs["30m"], dfs["5m"], dfs["15m"], dfs["1h"], dfs["1d"])
     except Exception as e:
         return {"error": f"時框對齊失敗: {e}"}
 
     if len(aligned) < 20:
         return {"error": "有效數據不足20根30m K線"}
 
-    atr_30m = calc_atr(dfs["30m"])
+    diag = {"total_bars": len(aligned), "step1_pass": 0,
+            "step2_alert": 0, "step3_entry": 0, "skip_nan": 0}
 
-    # ── 診斷計數器（找出哪一步卡住）─────────────────────
-    diag = {
-        "total_bars":    len(aligned),
-        "step1_pass":    0,   # 1d+1h 都多頭的 bar 數
-        "step2_alert":   0,   # Step2 預警觸發次數
-        "step3_entry":   0,   # Step3 實際入場次數
-        "skip_nan":      0,
-    }
+    trades       = []
+    in_trade     = False
+    entry_price  = entry_bar = entry_atr = None
+    prev_alerted = False
 
-    # ── 主回測循環 ────────────────────────────────────────
-    trades        = []
-    in_trade      = False
-    entry_price   = entry_bar = None
-    prev_alerted  = False   # 上一根是否已發出 Step2 預警
-
-    close_arr = aligned["close"].values
-    h30_arr   = aligned["h30"].values
-    d1_30_arr = aligned["d1_30"].values
-    d1_5_arr  = aligned["d1_5"].values
-    d1_15_arr = aligned["d1_15"].values
-    h1h_arr   = aligned["h1h"].values
-    h1d_arr   = aligned["h1d"].values
+    close_arr = aligned["close"].to_numpy(float)
+    open_arr  = aligned["open"].to_numpy(float)
+    high_arr  = aligned["high"].to_numpy(float)
+    low_arr   = aligned["low"].to_numpy(float)
+    atr_arr   = aligned["atr"].to_numpy(float)
+    h30_arr   = aligned["h30"].to_numpy(float)
+    d1_30_arr = aligned["d1_30"].to_numpy(float)
+    d1_5_arr  = aligned["d1_5"].to_numpy(float)
+    d1_15_arr = aligned["d1_15"].to_numpy(float)
+    h1h_arr   = aligned["h1h"].to_numpy(float)
+    h1d_arr   = aligned["h1d"].to_numpy(float)
     times     = aligned.index
 
     for i in range(5, len(aligned)):
-        # NaN 跳過
         if np.isnan(h30_arr[i]) or np.isnan(close_arr[i]):
             diag["skip_nan"] += 1
             prev_alerted = False
             continue
 
         if not in_trade:
-            # ── Step 1：大方向確認 ─────────────────────────
-            s1_1d = (not np.isnan(h1d_arr[i]) and h1d_arr[i] > 0)
-            s1_1h = (not np.isnan(h1h_arr[i]) and h1h_arr[i] > 0)
-            step1 = s1_1d and s1_1h
+            step1 = (not np.isnan(h1d_arr[i]) and h1d_arr[i] > 0 and
+                     not np.isnan(h1h_arr[i]) and h1h_arr[i] > 0)
             if step1:
                 diag["step1_pass"] += 1
-
-            if not step1:
+            else:
                 prev_alerted = False
                 continue
 
-            # ── Step 3 優先：上一根已預警，本根是否翻正？──
+            # Step 3：上一根已預警，本根 30m 實際翻正 → 入場
             if prev_alerted:
-                h30_prev = h30_arr[i-1]
-                step3 = (h30_prev < 0 and h30_arr[i] >= 0)
-                if step3:
+                step3 = (h30_arr[i-1] < 0 and h30_arr[i] >= 0)
+                if step3 and not np.isnan(atr_arr[i]) and atr_arr[i] > 0:
                     in_trade    = True
                     entry_bar   = i
                     entry_price = close_arr[i]
+                    entry_atr   = atr_arr[i]          # 入場當下的 ATR，之後不變
                     diag["step3_entry"] += 1
                     prev_alerted = False
                     continue
-                # 若上一根預警後本根仍負，繼續等（不重置 prev_alerted，
-                # 但要重新判斷 Step2 是否仍然成立）
 
-            # ── Step 2：傳導鏈 D+1 預測翻正（預警根）─────
-            s2_5m  = (not np.isnan(d1_5_arr[i])  and d1_5_arr[i]  > 0)
-            s2_15m = (not np.isnan(d1_15_arr[i]) and d1_15_arr[i] > 0)
-            s2_30m = (not np.isnan(d1_30_arr[i]) and d1_30_arr[i] > 0)
-            s2_neg = (h30_arr[i] < 0)   # 30m 當前仍為負（尚未翻正）
-
-            step2 = s2_5m and s2_15m and s2_30m and s2_neg
+            # Step 2：傳導鏈 D+1 全預測翻正、30m 仍為負 → 預警
+            step2 = (d1_5_arr[i] > 0 and d1_15_arr[i] > 0 and
+                     d1_30_arr[i] > 0 and h30_arr[i] < 0)   # NaN 比較為 False，等同舊版
             if step2:
                 prev_alerted = True
                 diag["step2_alert"] += 1
             else:
-                # Step2 不滿足，重置預警狀態
                 prev_alerted = False
 
         else:
-            # ── 出場檢測 ──────────────────────────────────
             prev_alerted = False
             bars_held = i - entry_bar
-            cur  = close_arr[i]
-            sl   = entry_price - atr_sl * atr_30m
-            tp   = entry_price + atr_tp * atr_30m
+            o, hi, lo, cur = open_arr[i], high_arr[i], low_arr[i], close_arr[i]
+            sl = entry_price - atr_sl * entry_atr
+            tp = entry_price + atr_tp * entry_atr
 
             reason = exit_price = None
-
-            # ATR 止損（所有模式共用）
-            if cur <= sl:
-                reason, exit_price = "止損", max(sl, cur)
-            # ATR 止盈（所有模式共用）
-            elif cur >= tp:
-                reason, exit_price = "止盈", min(tp, cur)
-            # ── 出場模式 ──────────────────────────────────
+            # 止損優先（保守）；跳空穿價以開盤價成交，否則以止損價成交
+            if o <= sl:
+                reason, exit_price = "止損", o
+            elif lo <= sl:
+                reason, exit_price = "止損", sl
+            elif o >= tp:
+                reason, exit_price = "止盈", o
+            elif hi >= tp:
+                reason, exit_price = "止盈", tp
             elif exit_mode == "固定根數":
                 if bars_held >= hold_bars:
                     reason, exit_price = "固定根數平倉", cur
-
             elif exit_mode == "30m轉負":
-                # 30m Histogram 從正轉負時出場
-                h30_cur  = h30_arr[i]
-                h30_prev_e = h30_arr[i-1] if i > 0 else h30_cur
-                if h30_prev_e >= 0 and h30_cur < 0:
+                if h30_arr[i-1] >= 0 and h30_arr[i] < 0:
                     reason, exit_price = "30m轉負出場", cur
-                # 保底：超過 hold_bars*3 根未出場則強制平倉
                 elif bars_held >= hold_bars * 3:
                     reason, exit_price = "保底平倉", cur
-
             elif exit_mode == "1d/1h轉負":
-                # 1d 或 1h Histogram 轉負時出場
-                h1h_cur = h1h_arr[i]
-                h1h_prv = h1h_arr[i-1] if i > 0 else h1h_cur
-                h1d_cur = h1d_arr[i]
-                h1d_prv = h1d_arr[i-1] if i > 0 else h1d_cur
-                h1h_neg = (not np.isnan(h1h_cur) and not np.isnan(h1h_prv)
-                           and h1h_prv >= 0 and h1h_cur < 0)
-                h1d_neg = (not np.isnan(h1d_cur) and not np.isnan(h1d_prv)
-                           and h1d_prv >= 0 and h1d_cur < 0)
+                h1h_neg = (not np.isnan(h1h_arr[i]) and not np.isnan(h1h_arr[i-1])
+                           and h1h_arr[i-1] >= 0 and h1h_arr[i] < 0)
+                h1d_neg = (not np.isnan(h1d_arr[i]) and not np.isnan(h1d_arr[i-1])
+                           and h1d_arr[i-1] >= 0 and h1d_arr[i] < 0)
                 if h1h_neg:
                     reason, exit_price = "1h轉負出場", cur
                 elif h1d_neg:
                     reason, exit_price = "1d轉負出場", cur
-                # 保底：超過 hold_bars*5 根未出場則強制平倉
                 elif bars_held >= hold_bars * 5:
                     reason, exit_price = "保底平倉", cur
 
             if reason:
-                pnl = (exit_price - entry_price) / entry_price * 100
+                gross = (exit_price - entry_price) / entry_price * 100
+                pnl   = gross - 2 * cost_pct
                 trades.append({
                     "entry_time":  times[entry_bar],
                     "exit_time":   times[i],
                     "entry_price": entry_price,
                     "exit_price":  exit_price,
                     "bars_held":   bars_held,
+                    "gross_pct":   gross,
                     "pnl_pct":     pnl,
                     "win":         pnl > 0,
                     "exit_reason": reason,
                     "date":        pd.Timestamp(times[entry_bar]).date(),
                 })
                 in_trade    = False
-                entry_price = entry_bar = None
+                entry_price = entry_bar = entry_atr = None
 
     if not trades:
         return {
             "trades": [], "total": 0, "wins": 0, "losses": 0,
             "win_rate": 0, "avg_win": 0, "avg_loss": 0,
-            "profit_factor": 0, "max_consec_loss": 0,
-            "total_return": 0, "aligned": aligned, "diag": diag,
+            "profit_factor": 0, "max_consec_loss": 0, "max_dd": 0,
+            "total_return": 0, "cost_pct": cost_pct,
+            "aligned": aligned, "diag": diag,
         }
 
     df_t   = pd.DataFrame(trades)
     wins   = df_t[df_t["win"]]
     losses = df_t[~df_t["win"]]
 
-    # 最大連虧
     mc = cur_mc = 0
     for w in df_t["win"]:
         cur_mc = 0 if w else cur_mc + 1
         mc     = max(mc, cur_mc)
+
+    cum  = np.r_[0.0, df_t["pnl_pct"].cumsum().to_numpy()]
+    max_dd = float((cum - np.maximum.accumulate(cum)).min())      # ≤ 0
 
     aw = wins["pnl_pct"].mean()   if len(wins)   > 0 else 0
     al = losses["pnl_pct"].mean() if len(losses) > 0 else 0
@@ -2775,7 +2797,9 @@ def run_cascade_backtest(symbol: str, atr_sl: float = 1.5,
         "avg_loss":        al,
         "profit_factor":   min(pf, 99),
         "max_consec_loss": mc,
+        "max_dd":          max_dd,
         "total_return":    df_t["pnl_pct"].sum(),
+        "cost_pct":        cost_pct,
         "aligned":         aligned,
         "diag":            diag,
     }
@@ -2920,7 +2944,7 @@ def render_bt_kpi(result: dict, symbol: str, hold_bars: int,
         <div class="metric-card">
             <div class="label">累計收益</div>
             <div class="value" style="color:{tc};font-size:30px;">{tr:+.1f}%</div>
-            <div class="sub">持{hold_bars}根·SL {atr_sl}×·TP {atr_tp}×ATR</div>
+            <div class="sub">最大回撤 {result.get('max_dd', 0):.1f}% · SL {atr_sl}× TP {atr_tp}×ATR · 已扣成本</div>
         </div>
     </div>"""
 
@@ -2929,12 +2953,13 @@ def render_trades_table(trades: list, max_rows: int = 25) -> str:
     cols = ["入場時間","出場時間","入場價","出場價","持倉根","盈虧%","結果","原因"]
     hdr  = "".join(f"<th>{c}</th>" for c in cols)
     body = ""
-    reason_cls = {"止損":"badge-bear","止盈":"badge-bull","到期平倉":"badge-neu"}
+    def _reason_cls(r):
+        return "badge-bear" if "止損" in r else ("badge-bull" if "止盈" in r else "badge-neu")
     for t in trades[-max_rows:]:
         pnl = t["pnl_pct"]
         pc_ = "cell-pos" if pnl >= 0 else "cell-neg"
         rslt= '<span class="badge badge-bull">▲ 盈</span>' if t["win"]               else '<span class="badge badge-bear">▼ 虧</span>'
-        rc  = reason_cls.get(t["exit_reason"], "badge-neu")
+        rc  = _reason_cls(t["exit_reason"])
         rb  = f'<span class="badge {rc}">{t["exit_reason"]}</span>'
         et  = str(t["entry_time"])[:16]
         xt  = str(t["exit_time"])[:16]
@@ -3022,26 +3047,27 @@ with st.sidebar:
                        if k.startswith(("df_","ts_","bt_","bt_ts_","_last_page"))]
         for k in keys_to_del:
             del st.session_state[k]
-        st.success(f"✅ 已清除 {len(keys_to_del)} 個快取，正在重新載入...")
+        _store = _data_store()
+        with _store["lock"]:
+            _n_shared = len(_store["data"])
+            _store["data"].clear()
+            _store["errors"].clear()
+        st.success(f"✅ 已清除 {len(keys_to_del) + _n_shared} 個快取，正在重新載入...")
         st.rerun()
     st.caption(f"更新：{datetime.now().strftime('%H:%M:%S')}")
 
 if auto_refresh:
-    from streamlit_autorefresh import st_autorefresh
-    # st_autorefresh 用 React component 定時觸發 st.rerun()
-    # 每次 rerun 前自動清除數據快取，確保數據一定更新
-    _count = st_autorefresh(
-        interval=refresh_interval * 1000,  # 毫秒
-        limit=None,                         # 無限次
-        key="autorefresh_timer",
-    )
-    if _count > 0:
-        # 每次 autorefresh 觸發時清除數據快取
-        _keys_expired = [k for k in st.session_state.keys()
-                         if k.startswith(("df_","ts_"))]
-        for _k in _keys_expired:
-            del st.session_state[_k]
-    st.info(f"⏱ 每 {refresh_interval} 秒自動更新 · 已刷新 {_count} 次")
+    try:
+        from streamlit_autorefresh import st_autorefresh
+    except ImportError:
+        st_autorefresh = None
+    if st_autorefresh is None:
+        st.warning("⚠️ 未安裝 streamlit-autorefresh，自動刷新無法運作：pip install streamlit-autorefresh")
+    else:
+        # v3.0：不再每次刷新清空全部快取；各時框依自己的 TTL 過期（見 _FETCH_TTL）
+        _count = st_autorefresh(interval=refresh_interval * 1000, limit=None,
+                                key="autorefresh_timer")
+        st.info(f"⏱ 每 {refresh_interval} 秒自動更新 · 已刷新 {_count} 次")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -3061,8 +3087,8 @@ if _last_fetch_ts:
     if (not auto_refresh) and _stale_h >= 2:
         st.warning(
             f"⚠️ 偵測到此分頁已約 {_stale_h:.1f} 小時沒有重新整理過(「自動刷新」目前關閉,"
-            f"Streamlit 只在互動或自動刷新觸發時才會重跑)。以下可能是舊快照,"
-            f"建議開啟自動刷新,或點側邊欄「🔄 立即清除快取」。"
+            "Streamlit 只在互動或自動刷新觸發時才會重跑)。以下可能是舊快照,"
+            "建議開啟自動刷新,或點側邊欄「🔄 立即清除快取」。"
         )
 
 _ttl_now = st.session_state.get("refresh_interval", 60)
@@ -3085,6 +3111,18 @@ tg_msgs_all = []
 rank_data   = []
 setup_results = {}
 
+# v3.0：並行預載所有需要的數據（原本是逐檔、逐時框串行請求）
+_specs = set()
+for _s in symbols:
+    for _tf in set(chain_tfs) | {main_tf}:
+        _c = TIMEFRAME_MAP[_tf]
+        _specs.add((_s, _c["period"], _c["interval"]))
+    _specs.add((_s, TIMEFRAME_MAP["1w"]["period"], "1wk"))   # 斐波那契掃描用
+    _specs.add((_s, "1y", "1d"))
+    _specs.add((_s, TIMEFRAME_MAP["1h"]["period"], "1h"))
+with st.spinner(f"並行載入 {len(symbols)} 檔數據..."):
+    prefetch_all(_specs)
+
 for symbol in symbols:
     st.markdown(f"## 🔷 {symbol}")
 
@@ -3094,7 +3132,8 @@ for symbol in symbols:
         live    = live_quote(df_raw, df_main, tf_cfg["interval"])
 
     if df_main.empty or len(df_main) < 30:
-        st.warning(f"⚠️ {symbol} 數據不足，跳過")
+        _err = _data_store()["errors"].get((symbol, tf_cfg["period"], tf_cfg["interval"]))
+        st.warning(f"⚠️ {symbol} 數據不足，跳過" + (f"（{_err}）" if _err else ""))
         st.markdown("---")
         continue
 
@@ -3166,7 +3205,7 @@ for symbol in symbols:
                 for _col, _h in zip(st.columns(4), _row):
                     _col.markdown(_h, unsafe_allow_html=True)
             st.markdown(
-                f"#### 🧱 支撐 / 阻力 <span style='font-size:13px;color:#888;font-weight:400;"
+                "#### 🧱 支撐 / 阻力 <span style='font-size:13px;color:#888;font-weight:400;"
                 f"margin-left:12px'>目前位置：{srp['pos']}</span>", unsafe_allow_html=True)
             st.markdown(sr_table_html(srp), unsafe_allow_html=True)
             st.markdown(pivots_html(srp["pivots"]), unsafe_allow_html=True)
@@ -3416,14 +3455,17 @@ for symbol in symbols:
     # ── 警報自動推送（去重：symbol+方向+等級 每小時最多一次）──
     if chain_tfs and tg_auto and resonance["alert"] and tg_token and tg_chat:
         _dk = hashlib.md5(
-            f"{symbol}|{resonance.get('direction')}|{resonance.get('level')}|{trigger_tf}|"
+            f"{tg_chat}|{symbol}|{resonance.get('direction')}|{resonance.get('level')}|{trigger_tf}|"
             f"{datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d %H')}".encode()
         ).hexdigest()
-        _sent = st.session_state.setdefault("tg_sent_hashes", set())
+        _sent = _tg_sent_store()
+        _now_ts = time.time()
+        for _old in [k for k, t in _sent.items() if _now_ts - t > 7200]:
+            _sent.pop(_old, None)
         if _dk not in _sent:
             ok_auto, _ = send_telegram(tg_token, tg_chat, tg_msg)
             if ok_auto:
-                _sent.add(_dk)
+                _sent[_dk] = _now_ts
                 st.toast(f"🔔 已自動推送 {symbol} 警報", icon="📡")
     if chain_tfs:
         with st.expander(f"📡 Telegram 信號 — {symbol}"):
@@ -3496,8 +3538,11 @@ if tg_send:
     if not tg_token or not tg_chat:
         st.error("請填寫 Bot Token 和 Chat ID")
     else:
-        ok = sum(1 for msg in tg_msgs_all
-                 if (send_telegram(tg_token, tg_chat, msg)[0] or time.sleep(0.5) or False))
+        ok = 0
+        for msg in tg_msgs_all:
+            if send_telegram(tg_token, tg_chat, msg)[0]:
+                ok += 1
+            time.sleep(0.5)
         st.success(f"✅ 已發送 {ok}/{len(tg_msgs_all)} 個信號")
 
 
@@ -3547,6 +3592,8 @@ with bc2:
 with bc3:
     bt_atr_sl = st.slider("止損 (×ATR 30m)", 0.5, 3.0, 1.5, 0.5)
     bt_atr_tp = st.slider("止盈 (×ATR 30m)", 1.0, 6.0, 3.0, 0.5)
+    bt_cost   = st.slider("單邊成本 %（手續費+滑價）", 0.0, 0.20, 0.05, 0.01,
+                          help="每筆來回扣 2×此值；高波動股（如 TSLA）建議 ≥0.05")
 with bc4:
     st.markdown("**出場模式說明**")
     if bt_exit_mode == "固定根數":
@@ -3574,11 +3621,14 @@ if run_bt and bt_symbols:
             "1d/1h轉負": "1d/1h Histogram 轉負",
         }[bt_exit_mode]
         st.markdown(f"## 📈 {bt_sym}  —  最近60天 · 出場：{mode_label}")
+        st.caption("回測規則：高時框只用已收盤數據、止損止盈以 K 線高低點判定（跳空以開盤價成交、"
+                   "同根雙觸視為止損）、ATR 取入場當下值、已扣單邊成本。")
 
         with st.spinner(f"載入 {bt_sym} 多時框數據並計算..."):
             result = run_cascade_backtest(
                 bt_sym, atr_sl=bt_atr_sl, atr_tp=bt_atr_tp,
                 hold_bars=bt_hold, exit_mode=bt_exit_mode,
+                cost_pct=bt_cost,
             )
 
         # 錯誤處理
@@ -3599,7 +3649,7 @@ if run_bt and bt_symbols:
                 tip = "目前市場可能處於空頭或震盪。建議等待 1d 和 1h 同時翻正後再回測。"
             elif step2_alert == 0:
                 bottleneck = "❌ Step 2 從未觸發：Step1 通過但傳導鏈 D+1 未同時預測翻正"
-                tip = "5m / 15m / 30m 的 D+1 預測未能同時 > 0。可能是震盪市，或者 5m 數據 yfinance 只能取 7天，可能不足。"
+                tip = "5m / 15m / 30m 的 D+1 預測未能同時 > 0。可能是震盪市，或樣本期（60天）內符合條件的機會太少。"
             elif step3_entry == 0:
                 bottleneck = "❌ Step 3 從未入場：預警發出但 30m Histogram 翻正時 Step1 已失效"
                 tip = "預警發出的下一根 K 線，1d 或 1h 已轉負。市場變化快，大方向短暫失效。可嘗試放寬 Step1 條件。"
@@ -3657,7 +3707,7 @@ if run_bt and bt_symbols:
             fig_pie = go.Figure(go.Pie(
                 labels=rc_counts.index.tolist(),
                 values=rc_counts.values.tolist(),
-                marker=dict(colors=["#c0392b","#3d8b5e","#5a7fa8"]),
+                marker=dict(colors=["#c0392b","#3d8b5e","#5a7fa8","#e07b39","#8e6bb0","#999999"]),
                 textinfo="label+percent", hole=0.4,
             ))
             fig_pie.update_layout(
@@ -3669,7 +3719,7 @@ if run_bt and bt_symbols:
 
         with col_reason:
             st.markdown("##### 各出場方式勝率")
-            for reason in ["止損","止盈","到期平倉"]:
+            for reason in df_t_bt["exit_reason"].value_counts().index:
                 sub = df_t_bt[df_t_bt["exit_reason"]==reason]
                 if len(sub) == 0: continue
                 wr_r = sub["win"].mean()*100
@@ -3718,13 +3768,6 @@ elif not run_bt:
 st.markdown("""
 <div style='text-align:center;color:#bbb;font-size:11px;margin-top:20px;
             font-family:IBM Plex Mono,monospace;'>
-MACD 瀑布動能傳導系統 v2.0 ｜ 數據：Yahoo Finance ｜ 僅供參考，不構成投資建議
-</div>
-""", unsafe_allow_html=True)
-
-st.markdown("""
-<div style='text-align:center;color:#bbb;font-size:11px;margin-top:20px;
-            font-family:IBM Plex Mono,monospace;'>
-MACD 瀑布動能傳導系統 v2.0 ｜ 數據：Yahoo Finance ｜ 僅供參考，不構成投資建議
+MACD 瀑布動能傳導系統 v3.0 ｜ 數據：Yahoo Finance ｜ 僅供參考，不構成投資建議
 </div>
 """, unsafe_allow_html=True)
