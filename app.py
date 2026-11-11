@@ -1896,6 +1896,42 @@ def rank_key(r):
     eff_dir = r["direction"] or leaning(r)
     return (lvl, pts, sub, 1 if eff_dir == "bear" else 0)
 
+# ── v3.1：週線否決 vs 日線「接近底部」的平衡規則 ──────────────────
+# 「接近底部」＝ STATUS_NEXT_DAY 對狀態「跌勢放緩」的下一交易日解讀，
+# 只代表下跌動能收斂（預期性訊號），不是反轉確認。
+_ANTICIPATORY_BOTTOM = {"跌勢放緩", "空頭減弱", "接近金叉"}          # 預期性：只能觀察
+_CONFIRMED_FLIP      = {"Histogram翻正", "MACD金叉確認", "多頭開始回補"}  # 已發生：可做反彈單
+
+def weekly_gate_note(r):
+    """
+    依「週線背景 × 主時框最新狀態」回傳一行給 AI 的硬性指令；不需提示時回傳 None。
+    原則：週線決定能不能做（倉位上限），日線只決定上限內何時做；不做加權平均。
+    """
+    wk = (r.get("setup") or {}).get("weekly")
+    if not wk:
+        return None
+    rows = r.get("macd_rows") or []
+    st_  = rows[-1]["status"] if rows else ""
+    nxt  = STATUS_NEXT_DAY.get(st_, ("", ""))[0]
+    rv   = r.get("rvol")
+    rv_ok = rv is not None and rv >= 1.5
+    tag  = f"週線{wk['label']}（{wk['score']}分）× 主時框狀態「{st_}」" + (f"（下一交易日：{nxt}）" if nxt else "")
+    if wk["label"] == "走弱":
+        if st_ in _ANTICIPATORY_BOTTOM:
+            return (f"- ⛔ 週線否決｜{tag}：預期性底部訊號不足以推翻週線 → 結論必須是「不買、列入觀察」，"
+                    "倉位 0；禁止輸出趨勢多單或『買入』。僅在日線 Hist 實際翻正後才重新評估。")
+        if st_ in _CONFIRMED_FLIP:
+            return (f"- ⚠️ 週線否決（反彈單例外）｜{tag}：只允許「反彈單」，倉位上限 1/3"
+                    + ("（RVOL≥1.5 已達標，站上 VWAP 可加至 1/2）" if rv_ok
+                       else "（RVOL 未達 1.5，維持 1/3 以下或放棄）")
+                    + "；止損 −0.75×ATR，目標＝最近壓力位/VWAP，日線 Hist 再轉負即出場，不留倉過週末，"
+                    "不得稱為趨勢反轉。")
+        return f"- ⛔ 週線走弱｜{tag}：不買；多單僅作觀察，空方訊號按原規則解讀。"
+    if wk["label"] == "盤整" and (st_ in _ANTICIPATORY_BOTTOM or st_ in _CONFIRMED_FLIP):
+        return (f"- 🟡 週線盤整｜{tag}：只給「輕倉」，倉位上限 1/2；預期性訊號須等日線翻正才進場。")
+    return None
+
+
 def build_analysis_prompt(rank_data, main_tf, trigger_tf,
                           chain_tfs=None, confirm_tfs=None, plan_style=None):
     """
@@ -1971,6 +2007,29 @@ def build_analysis_prompt(rank_data, main_tf, trigger_tf,
              "貼近 20 日高、近 8 日區間 ≤2.5×ATR、且低點抬高或量縮＝蓄勢待突破（觸發價＝20 日高＋0.1×ATR）。")
     L.append("- 止損＝回調低點 −0.5×日線ATR；T1＝波段高點 B，T2/T3＝127.2%/161.8% 延伸。")
 
+    L.append("")
+    L.append("## 週線與日線訊號衝突時的平衡規則（硬性，優先於其他加分項）")
+    L.append("核心原則：週線決定「能不能做」（倉位上限），日線決定「在上限內何時做」。"
+             "兩者衝突時不得加權平均成「中性」，一律由週線否決。")
+    L.append("- 名詞對照：表格中「下一交易日：接近底部」＝主時框狀態「跌勢放緩」（Hist<0 且絕對值縮小），"
+             "只代表下跌動能收斂的預期性訊號，不是反轉確認；趨勢下跌中會反覆出現。")
+    L.append("")
+    L.append("| 週線 | 主時框日線狀態 | 結論 | 倉位上限 |")
+    L.append("|---|---|---|---|")
+    L.append("| 走弱 | 跌勢放緩／空頭減弱／接近金叉（預期性） | 不買，只列觀察 | 0 |")
+    L.append("| 走弱 | Hist 已翻正／金叉確認，且 RVOL≥1.5 | 反彈單（非趨勢單） | 1/3 |")
+    L.append("| 走弱 | 同上，且價格站上 VWAP | 反彈單 | 1/2 |")
+    L.append("| 週線 Hist 收斂（跌幅放緩，尚未翻正） | 預期性底部訊號 | 到位待確認，等日線翻正再試探 | 1/3 |")
+    L.append("| 盤整 | 預期性或已翻正 | 輕倉 | 1/2 |")
+    L.append("| 上升 | 預期性底部訊號 | 正式買點（仍須 4H 確認） | 依原計畫 |")
+    L.append("- 反彈單紀律：止損＝入場價 −0.75×ATR（比一般 1.5×ATR 更緊）；目標＝最近壓力位或日線 VWAP，"
+             "不等趨勢延續；日線 Hist 再轉負即出場，不留倉過週末；"
+             "週線 Hist 連續 2 根收斂，才可從「反彈單」升級為正常倉位。")
+    L.append("- 理由（請在回答中遵守）：週線一根＝5 個交易日資訊，日線近 10 根只涵蓋約 2 週，樣本短、噪音大；"
+             "週線下跌中做多的賠率天然偏差——賺的是反彈幅度，賠的是趨勢延續。")
+    L.append("- 若你（AI）認為某檔應推翻上述規則，必須明確指出具體依據（例如基本面催化劑、週線結構已實際反轉），"
+             "並仍須遵守對應的倉位上限；不可只因日線指標好看就給出滿倉買入。")
+
     # ── 分析任務（原 1–4 項原樣保留，新增 5–7 項）──────────
     L.append("")
     L.append("請你在此技術面基礎上，補充做以下深度分析：")
@@ -1981,9 +2040,11 @@ def build_analysis_prompt(rank_data, main_tf, trigger_tf,
     L.append("5. 驗證各標的的斐波那契關鍵位、VWAP、ATR 止損/目標是否合理，必要時給出你認為更好的進場、止損、目標價位")
     L.append("6. 檢查各時框 Histogram 是否有方向衝突或背離（例如大時框多、小時框空），並說明應以哪個時框為主")
     L.append("7. 針對下一個交易日，給出情境推演（上漲／盤整／下跌各自的觸發條件與關鍵價位）")
+    L.append("8. 逐檔套用上方「週線與日線訊號衝突時的平衡規則」，標明每檔屬於哪一列、倉位上限為何；"
+             "凡標註「週線否決」的標的，不得列為買入推薦")
     L.append("")
     L.append("輸出要求：請用繁體中文；先給一張總結表"
-             "（代碼｜方向｜進場價｜止損價｜目標價｜風險報酬比｜信心）再逐檔說明；"
+             "（代碼｜方向｜週線背景｜進場價｜止損價｜目標價｜倉位上限｜風險報酬比｜信心）再逐檔說明；"
              "請給出具體價位與明確方向，避免模稜兩可的描述。")
 
     # ── 排行結果 ───────────────────────────────────────────
@@ -2018,6 +2079,15 @@ def build_analysis_prompt(rank_data, main_tf, trigger_tf,
         L.append(f"| {i} | {r['symbol']} | {dirn} | {lvl} | {score_disp} | "
                   f"{r.get('bull_pts',0)}/{r.get('bear_pts',0)} | "
                   f"{r['close']:.2f} | {r['atr_pct']:.2f}% | {r['trend']} | {rvol} | {vwapp} | {fibp} |")
+
+    # ── 週線否決清單（程式已判定，AI 須遵守）─────────────────
+    _gates = [(r["symbol"], weekly_gate_note(r)) for r in ranked]
+    _gates = [(s_, g) for s_, g in _gates if g]
+    if _gates:
+        L.append("")
+        L.append("## 週線否決檢查（程式依規則判定，請逐檔遵守）")
+        for s_, g in _gates:
+            L.append(g.replace("- ", f"- **{s_}**：", 1))
 
     # ── 斐波那契買點掃描總表 ───────────────────────────────
     _sres = {r["symbol"]: r.get("setup") for r in ranked if r.get("setup")}
@@ -2131,6 +2201,9 @@ def build_analysis_prompt(rank_data, main_tf, trigger_tf,
 
         # 斐波那契買點掃描（週線/日線/4H）
         L.extend(setup_prompt_lines(r.get("setup")))
+        _g = weekly_gate_note(r)
+        if _g:
+            L.append(_g)
 
         # 各時框（舊版單行原樣保留 + 完整明細表）
         casc = r.get("cascade") or []
